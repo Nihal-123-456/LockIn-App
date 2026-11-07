@@ -64,9 +64,19 @@ locks of 30 min / 1 h / 2 h.
    "Add..." -> tick days, set From/To. Example:
    every Sunday 14:00 - 15:00. Overnight rules are the same.
 
+4) PROGRAM LOCK (block specific programs instead of the whole PC)
+   In all three modes you can name programs (e.g. the game's
+   game.exe) in the "Programs to block instead" box, or click
+   "Browse..." to pick the exe file. Names are comma-separated.
+   While such a lock is active there is NO shield - the PC works
+   normally, but the listed programs are killed instantly on every
+   launch and even while already running, until the timer ends.
+   Default (box empty) = lock the whole PC as before.
+
 Pending one-time locks can be removed any time while unlocked.
 The green/red status line at the bottom always tells you whether
-you are locked and when the next lock starts.
+you are locked / which programs are blocked and when the next
+lock starts.
 
 While locked, the shield shows:
    * a large live countdown
@@ -123,7 +133,8 @@ rare case you truly must get in before the timer ends:
      stays inactive.)
   2) While in Safe Mode, do ONE of these:
      - Open the folder  %APPDATA%\LockIn  and delete config.json
-       (this clears all pending one-time locks), or
+       (this clears all pending one-time locks, including
+       program-block locks), or
      - edit config.json and set  "enabled": false  (master
        kill-switch), or
      - untick "Start with Windows" later / delete the shortcut.
@@ -136,16 +147,17 @@ Log file:         C:\Users\<you>\AppData\Roaming\LockIn\lockin.log
 ------------------------------------------------------------------
 7. HONEST LIMITATIONS
 ------------------------------------------------------------------
-* Ctrl+Alt+Del opens a SECURE screen no normal program can block.
-  From there a determined person can still reach Task Manager and
-  kill python.exe - LockIn then fails open and enforcement stops.
-  This tool is a commitment device against your own impulses, not
-  a security product against other people.
 * If a fullscreen game was running when the lock started, click
   the screen once so the shield can take over.
 * Enforcement is per Windows account; other accounts are unaffected.
 * If LockIn is not set to start with Windows, a reboot removes the
   active shield.
+* In program-lock mode the rest of the PC stays usable - if you have
+  another game/app installed, nothing stops you from opening that
+  instead. It blocks exactly the programs you named and nothing else.
+* Killing a running program is instant and forceful: unsaved data
+  in that program (e.g. game progress without checkpoints) is lost
+  when its lock window starts. Save first.
 
 
 ------------------------------------------------------------------

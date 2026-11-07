@@ -136,11 +136,6 @@ Log file:         C:\Users\<you>\AppData\Roaming\LockIn\lockin.log
 ------------------------------------------------------------------
 7. HONEST LIMITATIONS
 ------------------------------------------------------------------
-* Ctrl+Alt+Del opens a SECURE screen no normal program can block.
-  From there a determined person can still reach Task Manager and
-  kill python.exe - LockIn then fails open and enforcement stops.
-  This tool is a commitment device against your own impulses, not
-  a security product against other people.
 * If a fullscreen game was running when the lock started, click
   the screen once so the shield can take over.
 * Enforcement is per Windows account; other accounts are unaffected.

@@ -6,6 +6,9 @@ What it does
 * Lock your PC right now for a duration (e.g. 3 hours).
 * Lock your PC for a time period (e.g. today 14:00 - 15:00, overnight works too).
 * Weekly schedules (e.g. every Sunday 14:00 - 15:00), any days, overnight OK.
+* Program lock: name specific programs (e.g. a game's exe) in any of the three
+  modes above and ONLY those are blocked - killed instantly on every launch
+  until the timer ends; the rest of the PC stays usable.
 * While locked, an unclosable full-screen shield covers all monitors:
     - blocks Win key, Alt+Tab, Alt+Esc, Alt+F4, Ctrl+Esc, Ctrl+Shift+Esc,
       Alt+Space, and the 5x-Shift Sticky Keys prompt (low-level keyboard hook)
@@ -86,8 +89,10 @@ DEFAULT_CONFIG = {
     "motivational": True,     # rotating quotes on the lock screen
     "custom_message": "",     # if set, shown instead of quotes
     "start_with_windows": False,
-    "schedules": [],          # {"days":[0..6], "start":"HH:MM", "end":"HH:MM", "enabled":bool}
-    "one_time": [],           # {"start":"YYYY-MM-DDTHH:MM", "end":"YYYY-MM-DDTHH:MM"}
+    "schedules": [],          # {"days":[0..6], "start":"HH:MM", "end":"HH:MM", "enabled":bool,
+                              #  "targets":["game.exe"]} - targets omitted = locks the whole PC
+    "one_time": [],           # {"start":"YYYY-MM-DDTHH:MM", "end":"YYYY-MM-DDTHH:MM",
+                              #  "targets":["game.exe"]} - targets omitted = locks the whole PC
 }
 
 
@@ -105,6 +110,40 @@ def log(msg):
 # --------------------------------------------------------------------------
 # Parsing / formatting helpers
 # --------------------------------------------------------------------------
+def normalize_targets(value):
+    """Normalize a program-block target list or comma-separated string to a
+    clean list of lowercase exe basenames: ['c:\\Games\\Game.EXE'] ->
+    ['game.exe']. Returns [] for whole-PC locks."""
+    if isinstance(value, str):
+        value = value.replace(";", ",").split(",")
+    if not isinstance(value, list):
+        return []
+    out = []
+    for v in value:
+        if not isinstance(v, str):
+            continue
+        p = v.strip().strip('"').strip()
+        p = p.replace("\\", "/")
+        p = os.path.basename(p).strip().lower()
+        if not p:
+            continue
+        if not p.endswith(".exe"):
+            p += ".exe"
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def _mode_match(entry, mode):
+    """Filter lock entries by what they lock. mode: 'any' (both kinds),
+    'pc' (whole-PC entries only), 'apps' (program-block entries only)."""
+    if mode == "any":
+        return True
+    tgt = entry.get("targets")
+    is_app = isinstance(tgt, list) and bool(tgt)
+    return is_app if mode == "apps" else not is_app
+
+
 def parse_hm(s):
     """'14:00' -> (14, 0); returns None if invalid."""
     try:
@@ -183,11 +222,15 @@ def _end_delta(hm):
 # --------------------------------------------------------------------------
 # Scheduler (pure logic, testable on any OS)
 # --------------------------------------------------------------------------
-def is_active_now(now, cfg):
-    """True if a lock window (one-time or weekly schedule) covers `now`."""
+def is_active_now(now, cfg, mode="any"):
+    """True if a lock window (one-time or weekly schedule) covers `now`.
+    mode selects which lock kinds count: 'any', 'pc' (whole-PC shells) or
+    'apps' (program-block locks)."""
     if not cfg.get("enabled", True):
         return False
     for ot in cfg.get("one_time", []):
+        if not _mode_match(ot, mode):
+            continue
         try:
             s = datetime.fromisoformat(ot["start"])
             e = datetime.fromisoformat(ot["end"])
@@ -199,6 +242,8 @@ def is_active_now(now, cfg):
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     t = now - midnight
     for sc in cfg.get("schedules", []):
+        if not _mode_match(sc, mode):
+            continue
         if not sc.get("enabled", True):
             continue
         st = parse_hm(sc.get("start", ""))
@@ -223,8 +268,9 @@ def is_active_now(now, cfg):
     return False
 
 
-def active_until(now, cfg):
-    """If a lock is active at `now`, return when it ends (max end covering now)."""
+def active_until(now, cfg, mode="any"):
+    """If a lock is active at `now`, return when it ends (max end covering now).
+    mode: 'any', 'pc' or 'apps' - see is_active_now."""
     best = None
 
     def better(dt):
@@ -233,6 +279,8 @@ def active_until(now, cfg):
             best = dt
 
     for ot in cfg.get("one_time", []):
+        if not _mode_match(ot, mode):
+            continue
         try:
             s = datetime.fromisoformat(ot["start"])
             e = datetime.fromisoformat(ot["end"])
@@ -244,6 +292,8 @@ def active_until(now, cfg):
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     t = now - midnight
     for sc in cfg.get("schedules", []):
+        if not _mode_match(sc, mode):
+            continue
         if not sc.get("enabled", True):
             continue
         st = parse_hm(sc.get("start", ""))
@@ -264,6 +314,57 @@ def active_until(now, cfg):
             if ((dow - 1) % 7) in days and t < en_d:
                 better(midnight + en_d)
     return best
+
+
+def active_app_targets(now, cfg):
+    """If program-block locks are active at `now`, return their combined
+    blocked-program set and latest end time: (set_of_exe_names, end_dt).
+    Returns (None, None) when no program-block lock is active."""
+    if not cfg.get("enabled", True):
+        return None, None
+    targets = set()
+    end = None
+    for ot in cfg.get("one_time", []):
+        try:
+            s = datetime.fromisoformat(ot["start"])
+            e = datetime.fromisoformat(ot["end"])
+        except Exception:
+            continue
+        if s <= now < e and ot.get("targets"):
+            targets.update(ot["targets"])
+            if end is None or e > end:
+                end = e
+    dow = now.weekday()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    t = now - midnight
+    for sc in cfg.get("schedules", []):
+        if not sc.get("targets"):
+            continue
+        if not sc.get("enabled", True):
+            continue
+        st = parse_hm(sc.get("start", ""))
+        en = parse_hm(sc.get("end", ""))
+        if st is None or en is None:
+            continue
+        days = sc.get("days", [])
+        st_d = timedelta(hours=st[0], minutes=st[1])
+        en_d = _end_delta(en)
+        if st_d == en_d:
+            continue
+        hit = None
+        if st_d < en_d:
+            if dow in days and st_d <= t < en_d:
+                hit = midnight + en_d
+        else:
+            if dow in days and t >= st_d:
+                hit = midnight + timedelta(days=1) + en_d
+            elif ((dow - 1) % 7) in days and t < en_d:
+                hit = midnight + en_d
+        if hit is not None:
+            targets.update(sc["targets"])
+            if end is None or hit > end:
+                end = hit
+    return (targets, end) if targets else (None, None)
 
 
 def next_lock_start(now, cfg):
@@ -333,9 +434,13 @@ def load_config():
             en = parse_hm(s.get("end", ""))
             if not days or st is None or en is None:
                 continue
-            clean_sch.append({"days": days, "start": "%02d:%02d" % st,
-                              "end": "%02d:%02d" % en,
-                              "enabled": bool(s.get("enabled", True))})
+            sc_entry = {"days": days, "start": "%02d:%02d" % st,
+                        "end": "%02d:%02d" % en,
+                        "enabled": bool(s.get("enabled", True))}
+            tgt = normalize_targets(s.get("targets", []))
+            if tgt:
+                sc_entry["targets"] = tgt
+            clean_sch.append(sc_entry)
         except Exception:
             continue
     cfg["schedules"] = clean_sch
@@ -347,7 +452,11 @@ def load_config():
             s = datetime.fromisoformat(ot["start"])
             e = datetime.fromisoformat(ot["end"])
             if e > now and e > s:
-                keep_ot.append({"start": iso_min(s), "end": iso_min(e)})
+                ot_entry = {"start": iso_min(s), "end": iso_min(e)}
+                tgt = normalize_targets(ot.get("targets", []))
+                if tgt:
+                    ot_entry["targets"] = tgt
+                keep_ot.append(ot_entry)
         except Exception:
             continue
     cfg["one_time"] = keep_ot
@@ -513,6 +622,72 @@ if IS_WINDOWS:
         except Exception:
             pass
 
+    # ---- program-block watchdog (enumerate running processes by exe name) ----
+    TH32CS_SNAPPROCESS = 0x00000002
+    PROCESS_TERMINATE = 0x0001
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", wintypes.WCHAR * 260)]
+
+    def find_running_programs(exe_names):
+        """Set of (pid, exe_name) for every running process whose exe basename
+        is in the lowercase `exe_names` set. Skips LockIn's own process so a
+        typo'd target can never kill LockIn itself. Pure stdlib (tool-help)."""
+        found = set()
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == INVALID_HANDLE_VALUE:
+            return found
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                name = entry.szExeFile
+                if name.lower() in exe_names and entry.th32ProcessID != os.getpid():
+                    found.add((entry.th32ProcessID, name))
+                ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        except Exception as e:
+            log("process scan failed: %r" % (e,))
+        finally:
+            kernel32.CloseHandle(snap)
+        return found
+
+    def terminate_pid(pid):
+        """Hard-terminate a process. Returns True on (probable) success."""
+        try:
+            h = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            if not h:
+                return False
+            try:
+                return bool(kernel32.TerminateProcess(h, 1))
+            finally:
+                kernel32.CloseHandle(h)
+        except Exception:
+            return False
+
 
 # --------------------------------------------------------------------------
 # Low-level keyboard hook (blocks escape combos while a lock is active)
@@ -659,6 +834,25 @@ def pick_message(cfg):
     if cfg.get("motivational", True):
         return random.choice(QUOTES)
     return ""
+
+
+def browse_for_program(entry, parent=None):
+    """Open a file picker; append the chosen program's exe name to `entry`."""
+    try:
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            parent=parent, title="Choose the program to block",
+            filetypes=[("Program", "*.exe"), ("All files", "*.*")])
+        if not path:
+            return
+        name = os.path.basename(path)
+        cur = [p.strip() for p in entry.get().strip().strip(",").split(",") if p.strip()]
+        if name.lower() not in (c.lower() for c in cur):
+            cur.append(name)
+        entry.delete(0, "end")
+        entry.insert(0, ", ".join(cur))
+    except Exception:
+        log("browse_for_program failed:\n" + traceback.format_exc())
 
 
 if _HAS_TK:
@@ -814,10 +1008,26 @@ if _HAS_TK:
             self.en_end.insert(0, item["end"] if item else "15:00")
             self.en_end.pack(side="left", padx=(4, 0))
 
+            self.en_targets = None
+            tgt = normalize_targets(item.get("targets", []) if item else [])
+
+            rowt = ttk.Frame(frm)
+            rowt.pack(fill="x", pady=(10, 0))
+            ttk.Label(rowt, text="Programs to block instead (optional):").pack(side="left")
+            self.en_targets = ttk.Entry(rowt)
+            self.en_targets.pack(side="left", padx=8, fill="x", expand=True)
+            if tgt:
+                self.en_targets.insert(0, ", ".join(tgt))
+            ttk.Button(rowt, text="Browse...", command=lambda: self._browse_exe(self.en_targets)) \
+                .pack(side="left")
+
             ttk.Label(frm, foreground="#555555",
                       text="Time format: 14:00 or 2:00 pm (a bare hour like '2' means 2 pm). "
                            "If 'To' is earlier than 'From', "
                            "the lock runs overnight.").pack(anchor="w", pady=(10, 0))
+            ttk.Label(frm, foreground="#555555",
+                      text="If programs are named, only those are blocked during the window "
+                           "(blank = lock the whole PC).").pack(anchor="w")
 
             btnf = ttk.Frame(frm)
             btnf.pack(pady=(14, 0))
@@ -827,6 +1037,9 @@ if _HAS_TK:
             self.bind("<Return>", lambda e: self.on_ok())
             self.bind("<Escape>", lambda e: self.destroy())
             self.grab_set()
+
+        def _browse_exe(self, entry):
+            browse_for_program(entry, parent=self)
 
         def on_ok(self):
             days = [i for (i, v) in self.day_vars if v.get()]
@@ -847,6 +1060,9 @@ if _HAS_TK:
                 return
             self.result = {"days": days, "start": "%02d:%02d" % st,
                            "end": "%02d:%02d" % en, "enabled": True}
+            tgt = normalize_targets(self.en_targets.get())
+            if tgt:
+                self.result["targets"] = tgt
             self.destroy()
 
     class SettingsWindow(_BaseTop):
@@ -856,8 +1072,8 @@ if _HAS_TK:
             self.app = app
             super().__init__(app.root)
             self.title("LockIn - PC Lock & Focus Shield")
-            self.geometry("680x720")
-            self.minsize(620, 560)
+            self.geometry("680x780")
+            self.minsize(620, 600)
             try:
                 if ICON_PATH and os.path.exists(ICON_PATH):
                     self.iconbitmap(ICON_PATH)
@@ -894,9 +1110,20 @@ if _HAS_TK:
                                 ("3 h", 180), ("4 h", 240)):
                 ttk.Button(rowp, text=label, width=7,
                            command=lambda m=mins: self.set_preset(m)).pack(side="left", padx=3)
+            rowt = ttk.Frame(g1)
+            rowt.pack(fill="x", pady=(8, 0))
+            ttk.Label(rowt, text="Programs to block instead (optional):").pack(side="left")
+            self.en_tgt1 = ttk.Entry(rowt)
+            self.en_tgt1.pack(side="left", padx=8, fill="x", expand=True)
+            ttk.Button(rowt, text="Browse...", command=lambda: self._browse_exe(self.en_tgt1)) \
+                .pack(side="left")
+            ttk.Label(g1, foreground="#555555",
+                      text="Leave empty to lock the WHOLE PC. Or name programs "
+                           "(comma-separated, e.g. the game's .exe) and only those are "
+                           "blocked - killed instantly on every launch, even while running.").pack(anchor="w", pady=(4, 0))
             ttk.Label(g1, foreground="#B33900",
-                      text="Minimum 5 minutes. NO ESCAPE: once the shield is up it stays until "
-                           "the timer ends. Plan your breaks first!").pack(anchor="w", pady=(8, 0))
+                      text="Minimum 5 minutes. NO ESCAPE: it stays until the timer ends. "
+                           "Killed programs lose unsaved work - plan your breaks first!").pack(anchor="w", pady=(4, 0))
 
             # ---- 2. period lock ----
             g2 = ttk.LabelFrame(outer, text=" 2. Lock for a time period ", padding=10)
@@ -917,23 +1144,33 @@ if _HAS_TK:
             self.en_end2.pack(side="left", padx=4)
             ttk.Button(row2, text="Schedule lock",
                        command=self.on_schedule_period).pack(side="left", padx=(16, 0))
+            rowt2 = ttk.Frame(g2)
+            rowt2.pack(fill="x", pady=(8, 0))
+            ttk.Label(rowt2, text="Programs to block instead (optional):").pack(side="left")
+            self.en_tgt2 = ttk.Entry(rowt2)
+            self.en_tgt2.pack(side="left", padx=8, fill="x", expand=True)
+            ttk.Button(rowt2, text="Browse...", command=lambda: self._browse_exe(self.en_tgt2)) \
+                .pack(side="left")
             ttk.Label(g2, foreground="#555555",
                       text="Date: YYYY-MM-DD, 'today' or 'tomorrow' (slashes = M/D/Y, "
                            "dots or dashes = D.M.Y). Times: 14:00 or 2:00 pm ('2' = 2 pm). "
-                           "'To' earlier than 'From' runs overnight.").pack(anchor="w", pady=(8, 0))
+                           "'To' earlier than 'From' runs overnight. If programs are set, "
+                           "only those are blocked instead of the whole PC.").pack(anchor="w", pady=(8, 0))
 
             # ---- 3. weekly schedule ----
             g3 = ttk.LabelFrame(outer, text=" 3. Weekly schedule (repeats every week) ", padding=10)
             g3.pack(fill="x", pady=6)
-            cols = ("days", "start", "end", "on")
+            cols = ("days", "start", "end", "programs", "on")
             self.tree = ttk.Treeview(g3, columns=cols, show="headings", height=4)
             self.tree.heading("days", text="Days")
             self.tree.heading("start", text="From")
             self.tree.heading("end", text="To")
+            self.tree.heading("programs", text="Programs")
             self.tree.heading("on", text="Active")
-            self.tree.column("days", width=320)
+            self.tree.column("days", width=230)
             self.tree.column("start", width=80, anchor="center")
             self.tree.column("end", width=80, anchor="center")
+            self.tree.column("programs", width=170, anchor="w")
             self.tree.column("on", width=70, anchor="center")
             self.tree.pack(fill="x")
             rowb = ttk.Frame(g3)
@@ -988,6 +1225,9 @@ if _HAS_TK:
             self.protocol("WM_DELETE_WINDOW", self.destroy)
 
         # ---------- helpers ----------
+        def _browse_exe(self, entry):
+            browse_for_program(entry, parent=self)
+
         def set_preset(self, mins):
             self.sp_hours.set(str(mins // 60))
             self.sp_mins.set(str(mins % 60))
@@ -1010,11 +1250,12 @@ if _HAS_TK:
                 messagebox.showerror(APP_NAME, "Enter valid hours (0-72) and minutes (0-59).",
                                      parent=self)
                 return
-            self.app.lock_now_minutes(h * 60 + m, parent=self)
+            self.app.lock_now_minutes(h * 60 + m, targets=self.en_tgt1.get(), parent=self)
 
         def on_schedule_period(self):
             self.app.schedule_period(self.en_date.get(), self.en_start2.get(),
-                                     self.en_end2.get(), parent=self)
+                                     self.en_end2.get(), targets=self.en_tgt2.get(),
+                                     parent=self)
 
         def on_add_sched(self):
             dlg = ScheduleDialog(self)
@@ -1109,9 +1350,11 @@ if _HAS_TK:
                     self.tree.delete(i)
                 for idx, s in enumerate(self.app.cfg.get("schedules", [])):
                     days = ", ".join(DAY_NAMES.get(d, "?") for d in sorted(s.get("days", [])))
+                    progs = ", ".join(s.get("targets", [])) or "(whole PC)"
                     on = "Yes" if s.get("enabled", True) else "No"
                     self.tree.insert("", "end", iid=str(idx),
-                                     values=(days or "-", s.get("start"), s.get("end"), on))
+                                     values=(days or "-", s.get("start"), s.get("end"),
+                                             progs, on))
                 self.lb_ontime.delete(0, "end")
                 for ot in self.app.cfg.get("one_time", []):
                     try:
@@ -1121,6 +1364,8 @@ if _HAS_TK:
                                               e.strftime("%a %d %b %Y, %H:%M"))
                     except Exception:
                         txt = str(ot)
+                    if ot.get("targets"):
+                        txt += "   (programs: %s)" % ", ".join(ot["targets"])
                     self.lb_ontime.insert("end", txt)
             except Exception:
                 log("refresh_lists failed:\n" + traceback.format_exc())
@@ -1146,6 +1391,8 @@ class App:
         self._clock_guard_ref = None    # time.monotonic() when the guard was (re)anchored
         self._clock_guard_wall = None   # wall-clock time at that anchor
         self._seen_end = None           # longest active_until seen; re-anchor if it grows
+        self._app_block_on = False      # program-block mode currently running?
+        self._last_block_popup = 0.0    # time.time() of last blocked-program popup
 
         self.hook = KeyboardHook()
         self.hook.start()
@@ -1190,9 +1437,11 @@ class App:
                 self.root.after(0, self.overlay.reassert)
             self._was_locked_session = wl
 
-        active = is_active_now(now, self.cfg)
-        if active:
-            end = active_until(now, self.cfg) or (now + timedelta(minutes=1))
+        pc_active = is_active_now(now, self.cfg, "pc")
+        if pc_active:
+            active = True
+            self._app_block_on = False   # a full-PC shield supersedes program blocks
+            end = active_until(now, self.cfg, "pc") or (now + timedelta(minutes=1))
             if self._seen_end is None or end > self._seen_end:
                 # First tick of a new lock, or an overlapping window extended
                 # it: re-anchor the anti-clock-tampering guard from here.
@@ -1228,14 +1477,18 @@ class App:
                         pass
                     self.overlay = None
         else:
-            if self._seen_end is not None:
-                # Lock ended: release the guard anchors and stale hook state.
+            # No whole-PC lock: possibly a program-block window is running instead.
+            if self.overlay is not None:
+                self._close_overlay()
+            self._app_tick(now)
+            active = is_active_now(now, self.cfg)
+
+            if not active and self._seen_end is not None:
+                # All locks ended: release the guard anchors and stale hook state.
                 self._clock_guard_ref = None
                 self._clock_guard_wall = None
                 self._seen_end = None
                 self.hook.reset_shift_counter()
-            if self.overlay is not None:
-                self._close_overlay()
 
         if self.settings is not None:
             try:
@@ -1264,6 +1517,85 @@ class App:
         self.notify_tray(APP_NAME, "Lock ended - welcome back!")
         self.refresh_settings_lists()
 
+    # ------------------------------------------------------- program block
+    def _app_tick(self, now):
+        """Run one watchdog pass for program-block locks (no shield, no hook):
+        scan for blocked programs, kill them, show a small popup on kills."""
+        try:
+            targets, end = active_app_targets(now, self.cfg)
+        except Exception:
+            log("active_app_targets failed:\n" + traceback.format_exc())
+            targets, end = None, None
+
+        if targets:
+            # anchor the anti-clock-tampering guard for program locks too,
+            # so setting the system clock forward cannot shorten the window
+            if end and (self._seen_end is None or end > self._seen_end):
+                self._clock_guard_ref = time.monotonic()
+                self._clock_guard_wall = now
+                self._seen_end = end
+            if not self._app_block_on:
+                self._app_block_on = True
+                self._last_block_popup = 0.0
+                self.notify_tray(APP_NAME, "Programs blocked until %s: %s."
+                                 % (end.strftime("%H:%M") if end else "?",
+                                    ", ".join(sorted(targets))))
+            if IS_WINDOWS:
+                self._kill_blocked(targets, end)
+        elif self._app_block_on:
+            self._app_block_on = False
+            self.notify_tray(APP_NAME, "Programs unblocked. Lock ended.")
+
+    def _kill_blocked(self, targets, end):
+        """Scan for running instances of the blocked programs and terminate
+        them. Fails open: if the scan errors, nothing is killed this tick."""
+        try:
+            running = find_running_programs(set(targets))
+        except Exception:
+            log("process scan error:\n" + traceback.format_exc())
+            return
+        killed = set()
+        for pid, exe_name in running:
+            if terminate_pid(pid):
+                killed.add(exe_name)
+        if not killed:
+            return
+        log("blocked programs killed: %s" % ", ".join(sorted(killed)))
+        if time.time() - self._last_block_popup >= 8.0:
+            self._last_block_popup = time.time()
+            self.root.after(0, self._show_blocked_popup, sorted(targets), end)
+
+    def _show_blocked_popup(self, names, end):
+        """Small transient popup telling the user why their program vanished."""
+        top = None
+        try:
+            top = tk.Toplevel(self.root)
+            top.overrideredirect(True)
+            top.attributes("-topmost", True)
+            top.configure(bg="#101010")
+            inner = tk.Frame(top, bg="#101010", padx=16, pady=10)
+            inner.pack(fill="both", expand=True)
+            tk.Label(inner, text="\U0001F512 Blocked by LockIn",
+                     font=("Segoe UI", 12, "bold"), fg="#FF6B6B",
+                     bg="#101010").pack(anchor="w")
+            tk.Label(inner, text="%s cannot start.\nTry again after the timer ends at %s."
+                     % (", ".join(names),
+                        end.strftime("%H:%M") if end else "the scheduled time"),
+                     font=("Segoe UI", 10), fg="#E4E4E4", bg="#101010",
+                     justify="left").pack(anchor="w", pady=(4, 0))
+            top.update_idletasks()
+            sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+            w, h = top.winfo_reqwidth(), top.winfo_reqheight()
+            top.geometry("%dx%d+%d+%d" % (w, h, (sw - w) // 2, 40))
+            top.after(6000, top.destroy)
+        except Exception:
+            log("blocked popup failed:\n" + traceback.format_exc())
+            try:
+                if top is not None:
+                    top.destroy()
+            except Exception:
+                pass
+
     # ------------------------------------------------------------- tray icon
     def _setup_tray(self):
         try:
@@ -1288,7 +1620,7 @@ class App:
                                  lambda *a: self._tray_call(lambda: self.lock_now_minutes(120))),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Exit", self._tray_exit,
-                                 enabled=lambda item: not self.is_locked()),
+                                 enabled=lambda item: self.can_exit()),
             )
             self.tray = pystray.Icon(APP_NAME, image, APP_NAME, menu)
             self.tray.run_detached()
@@ -1360,6 +1692,12 @@ class App:
     def is_locked(self):
         return self.overlay is not None
 
+    def can_exit(self):
+        """False while a full-PC shield or a program-block window is active."""
+        if self.is_locked():
+            return False
+        return not is_active_now(self.guarded_now(datetime.now()), self.cfg, "apps")
+
     def guarded_now(self, now):
         """Clamp wall-clock reads while a lock is active, so setting the system
         clock forward cannot shorten the lock. Clock moves backward are allowed
@@ -1392,7 +1730,7 @@ class App:
             log("recheck failed:\n" + traceback.format_exc())
         self.refresh_settings_lists()
 
-    def lock_now_minutes(self, total_minutes, parent=None):
+    def lock_now_minutes(self, total_minutes, targets=None, parent=None):
         if self.is_locked():
             self.notify_tray(APP_NAME, "Already locked.")
             return False
@@ -1400,20 +1738,33 @@ class App:
             messagebox.showerror(APP_NAME, "Minimum lock time is %d minutes." % MIN_LOCK_MINUTES,
                                  parent=parent)
             return False
+        tgt = normalize_targets(targets or [])
         if total_minutes > 360:
-            if not messagebox.askyesno(
-                    APP_NAME,
-                    "This will lock the PC for %s with NO escape (not even a password).\n\n"
-                    "Are you sure?" % format_seconds(total_minutes * 60), parent=parent):
+            if tgt:
+                msg = ("This will block %s for %s with NO escape: the programs are "
+                       "killed immediately (unsaved work lost), also when already "
+                       "running.\n\nAre you sure?"
+                       % (", ".join(tgt), format_seconds(total_minutes * 60)))
+            else:
+                msg = ("This will lock the PC for %s with NO escape (not even a password).\n\n"
+                       "Are you sure?" % format_seconds(total_minutes * 60))
+            if not messagebox.askyesno(APP_NAME, msg, parent=parent):
                 return False
         now = datetime.now()
-        self.cfg["one_time"].append({"start": iso_min(now),
-                                     "end": iso_min(now + timedelta(minutes=total_minutes))})
+        entry = {"start": iso_min(now),
+                 "end": iso_min(now + timedelta(minutes=total_minutes))}
+        if tgt:
+            entry["targets"] = tgt
+        self.cfg["one_time"].append(entry)
         self.save_and_recheck()
-        self.notify_tray(APP_NAME, "PC locked for %s." % format_seconds(total_minutes * 60))
+        if tgt:
+            self.notify_tray(APP_NAME, "%s blocked for %s."
+                             % (", ".join(tgt), format_seconds(total_minutes * 60)))
+        else:
+            self.notify_tray(APP_NAME, "PC locked for %s." % format_seconds(total_minutes * 60))
         return True
 
-    def schedule_period(self, date_s, start_s, end_s, parent=None):
+    def schedule_period(self, date_s, start_s, end_s, targets=None, parent=None):
         d = parse_date_flexible(date_s)
         if d is None:
             messagebox.showerror(APP_NAME, "Invalid date. Use YYYY-MM-DD, 'today' or 'tomorrow'.",
@@ -1424,6 +1775,7 @@ class App:
         if st is None or en is None:
             messagebox.showerror(APP_NAME, "Invalid time. Use 14:00 or 2:00 pm.", parent=parent)
             return False
+        tgt = normalize_targets(targets or [])
         start_dt = datetime.combine(d, dtime(st[0], st[1]))
         end_dt = datetime.combine(d, dtime(en[0], en[1]))
         if end_dt <= start_dt:
@@ -1439,7 +1791,10 @@ class App:
                     "This period lock lasts %s with NO escape.\n\nContinue?"
                     % format_seconds(mins * 60), parent=parent):
                 return False
-        self.cfg["one_time"].append({"start": iso_min(start_dt), "end": iso_min(end_dt)})
+        entry = {"start": iso_min(start_dt), "end": iso_min(end_dt)}
+        if tgt:
+            entry["targets"] = tgt
+        self.cfg["one_time"].append(entry)
         self.save_and_recheck()
         messagebox.showinfo(APP_NAME, "Lock scheduled:\n%s  ->  %s"
                             % (start_dt.strftime("%a %d %b %Y, %H:%M"),
@@ -1459,11 +1814,17 @@ class App:
         self.save_config_only()
 
     def status_text(self, now):
-        if is_active_now(now, self.cfg):
-            end = active_until(now, self.cfg)
+        if is_active_now(now, self.cfg, "pc"):
+            end = active_until(now, self.cfg, "pc")
             until = end.strftime("%H:%M") if end else "?"
             rem = format_seconds((end - now).total_seconds()) if end else "?"
             return "LOCKED - shield up until %s   (%s remaining)" % (until, rem)
+        targets, end = active_app_targets(now, self.cfg)
+        if targets:
+            until = end.strftime("%H:%M") if end else "?"
+            rem = format_seconds((end - now).total_seconds()) if end else "?"
+            return "BLOCKED - %s cannot start until %s   (%s remaining)" \
+                   % (", ".join(sorted(targets)), until, rem)
         nxt = next_lock_start(now, self.cfg)
         if nxt is None:
             return "Unlocked. No locks scheduled."
@@ -1476,7 +1837,7 @@ class App:
         return "Unlocked. Next lock: %s." % when
 
     def exit_app(self):
-        if self.is_locked():
+        if not self.can_exit():
             self.notify_tray(APP_NAME, "A lock is active. LockIn cannot exit now.")
             return
         try:
